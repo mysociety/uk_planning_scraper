@@ -4,15 +4,32 @@ require 'pp'
 module UKPlanningScraper
   class Authority
     private
+
+    def base_url
+      @base_url ||= @url.match(/(https?:\/\/.+?)\//)[1]
+    end
+
+    def agent
+      @agent ||= Mechanize.new
+    end
+
+    def get(url, &block)
+      puts "Getting: #{url}"
+      res = agent.get(url)
+
+      if res.code == '200' # That's a String not an Integer, ffs
+        block_given? ? block.call(res) : res
+      else
+        puts "Error: HTTP #{res.code}"
+      end
+    end
+
     def scrape_idox(params, options)
       puts "Using Idox scraper."
-      base_url = @url.match(/(https?:\/\/.+?)\//)[1]
 
       apps = []
 
-      agent = Mechanize.new
-      puts "Getting: #{@url}"
-      page = agent.get(@url) # load the search form page
+      page = get(@url) # load the search form page
 
       # Check that the search form is actually present.
       # When Idox has an internal error it returns an error page with HTTP 200.
@@ -100,8 +117,7 @@ module UKPlanningScraper
         if next_button = page.at('a.next')
           next_url = base_url + next_button[:href]# + '&searchCriteria.resultsPerPage=100'
           sleep options[:delay]
-          puts "Getting: #{next_url}"
-          page = agent.get(next_url)
+          page = get(next_url)
         else
           break
         end
@@ -110,73 +126,136 @@ module UKPlanningScraper
       # Scrape the summary tab for each app
       apps.each_with_index do |app, i|
         sleep options[:delay]
-        puts "#{i + 1} of #{apps.size}: #{app.info_url}"
-        res = agent.get(app.info_url)
+        puts "#{i + 1} of #{apps.size}"
 
-        if res.code == '200' # That's a String not an Integer, ffs
-          # Parse the summary tab for this app
+        parse_info_url(app) if app.info_url
 
-          app.scraped_at = Time.now
+        next unless params[:include_property]
+        parse_property_url(app) if app.property_url
+        parse_property_detail_urls(app) if app.property_detail_urls
+      end # scrape summary tab for apps
+      apps
+    end # scrape_idox
 
-          # The Documents tab doesn't show if there are no documents (we get li.nodocuments instead)
-          # Bradford has #tab_documents but without the document count on it
-          app.documents_count = 0
+    def parse_info_url(app)
+      get(app.info_url) do |res|
+        # Parse the summary tab for this app
 
-          if documents_link = res.at('.associateddocument a')
-            if documents_link.inner_text.match(/\d+/)
-              app.documents_count = documents_link.inner_text.match(/\d+/)[0].to_i
-              app.documents_url = base_url + documents_link[:href]
-            end
-          elsif documents_link = res.at('#tab_documents')
-            if documents_link.inner_text.match(/\d+/)
-              app.documents_count = documents_link.inner_text.match(/\d+/)[0].to_i
-              app.documents_url = base_url + documents_link[:href]
-            end
+        app.scraped_at = Time.now
+
+        # The Documents tab doesn't show if there are no documents (we get li.nodocuments instead)
+        # Bradford has #tab_documents but without the document count on it
+        app.documents_count = 0
+
+        if documents_link = res.at('.associateddocument a')
+          if documents_link.inner_text.match(/\d+/)
+            app.documents_count = documents_link.inner_text.match(/\d+/)[0].to_i
+            app.documents_url = base_url + documents_link[:href]
           end
+        elsif documents_link = res.at('#tab_documents')
+          if documents_link.inner_text.match(/\d+/)
+            app.documents_count = documents_link.inner_text.match(/\d+/)[0].to_i
+            app.documents_url = base_url + documents_link[:href]
+          end
+        end
 
-          # We need to find values in the table by using the th labels.
-          # The row indexes/positions change from site to site (or even app to app) so we can't rely on that.
+        # We need to find values in the table by using the th labels.
+        # The row indexes/positions change from site to site (or even app to app) so we can't rely on that.
 
-          res.search('#simpleDetailsTable tr').each do |row|
+        res.search('#simpleDetailsTable tr').each do |row|
+          key = row.at('th').inner_text.strip
+          value = row.at('td').inner_text.strip
+
+          case key
+            when 'Reference'
+              app.council_reference = value
+            when 'Alternative Reference'
+              app.alternative_reference = value unless value.empty?
+            when 'Planning Portal Reference'
+              app.alternative_reference = value unless value.empty?
+            when 'Application Received'
+              app.date_received = Date.parse(value) if value.match(/\d/)
+            when 'Application Registered'
+              app.date_received = Date.parse(value) if value.match(/\d/)
+            when 'Application Validated'
+              app.date_validated = Date.parse(value) if value.match(/\d/)
+            when 'Address'
+              app.address = value unless value.empty?
+            when 'Proposal'
+              app.description = value unless value.empty?
+            when 'Status'
+              app.status = value unless value.empty?
+            when 'Decision'
+              app.decision = value unless value.empty?
+            when 'Decision Issued Date'
+              app.date_decision = Date.parse(value) if value.match(/\d/)
+            when 'Appeal Status'
+              app.appeal_status = value unless value.empty?
+            when 'Appeal Decision'
+              app.appeal_decision = value unless value.empty?
+            else
+              puts "Error: key '#{key}' not found"
+          end # case
+        end # each row
+
+        # find associated property link
+        property_association_link = res.at('p.associatedproperty a')
+
+        if property_association_link
+          app.property_url = base_url + property_association_link[:href]
+          app.property_count = property_association_link.inner_text.to_i
+        end
+      end # get
+    end
+
+    def parse_property_url(app)
+      # get URLs of property pages
+      app.property_detail_urls = []
+
+      get(app.property_url) do |res|
+        res.search('#Property li a').each_with_index do |property_link, index|
+          break if index >= 10
+
+          app.property_detail_urls << base_url + property_link[:href]
+        end
+      end
+    end
+
+    def parse_property_detail_urls(app)
+      # get property details
+      app.properties = []
+
+      app.property_detail_urls.each do |property_url|
+        get(property_url) do |res|
+          property = Property.new
+
+          res.search('#propertyAddress tr').each do |row|
             key = row.at('th').inner_text.strip
             value = row.at('td').inner_text.strip
 
             case key
-              when 'Reference'
-                app.council_reference = value
-              when 'Alternative Reference'
-                app.alternative_reference = value unless value.empty?
-              when 'Planning Portal Reference'
-                app.alternative_reference = value unless value.empty?
-              when 'Application Received'
-                app.date_received = Date.parse(value) if value.match(/\d/)
-              when 'Application Registered'
-                app.date_received = Date.parse(value) if value.match(/\d/)
-              when 'Application Validated'
-                app.date_validated = Date.parse(value) if value.match(/\d/)
-              when 'Address'
-                app.address = value unless value.empty?
-              when 'Proposal'
-                app.description = value unless value.empty?
-              when 'Status'
-                app.status = value unless value.empty?
-              when 'Decision'
-                app.decision = value unless value.empty?
-              when 'Decision Issued Date'
-                app.date_decision = Date.parse(value) if value.match(/\d/)
-              when 'Appeal Status'
-                app.appeal_status = value unless value.empty?
-              when 'Appeal Decision'
-                app.appeal_decision = value unless value.empty?
-              else
-                puts "Error: key '#{key}' not found"
-            end # case
-          end # each row
-        else
-          puts "Error: HTTP #{res.code}"
-        end # if
-      end # scrape summary tab for apps
-      apps
-    end # scrape_idox
+            when 'UPRN:'
+              property.uprn = value
+            when 'Full Address:'
+              property.address = value unless value.empty?
+            when 'Property Number:'
+              property.number = value unless value.empty?
+            when 'Street:'
+              property.street = value unless value.empty?
+            when 'Town:'
+              property.town = value unless value.empty?
+            when 'Postcode:'
+              property.postcode = value unless value.empty?
+            when 'Ward:'
+              property.ward = value unless value.empty?
+            when 'Parish:'
+              property.parish = value unless value.empty?
+            end
+          end
+
+          app.properties << property
+        end
+      end
+    end
   end # class
 end
